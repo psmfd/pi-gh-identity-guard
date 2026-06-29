@@ -6,6 +6,14 @@ declared per-repo, and blocks on drift. Fail-closed at the tool boundary.
 
 Source ADRs: [`adrs/0022-gh-identity-guard-extension.md`](https://github.com/psmfd/pi-config/blob/main/adrs/0022-gh-identity-guard-extension.md), [`adrs/0027-gh-identity-guard-tracked-expected-identity.md`](https://github.com/psmfd/pi-config/blob/main/adrs/0027-gh-identity-guard-tracked-expected-identity.md).
 
+## Install
+
+```sh
+pi install git:github.com/psmfd/pi-gh-identity-guard
+```
+
+Try it first without installing: `pi -e git:github.com/psmfd/pi-gh-identity-guard`.
+
 ## Why this exists
 
 `gh auth status` reads a config-file flag (`active`) that can disagree with
