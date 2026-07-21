@@ -211,6 +211,17 @@ test("heredoc same-line && suffix is preserved", () => {
   assert.equal(result.mutating, true);
 });
 
+test("heredoc operator glued to the verb still classifies (#789/ADR-0113)", () => {
+  // `git<<EOF push origin main` is valid bash — `<` breaks a word with no
+  // preceding whitespace. The classifier's operator-EXCISING stripHeredocs
+  // yields `git push origin main` -> mutating. Locks the divergence from
+  // shared/shell-lex.ts, whose operator-PRESERVING strip would leave
+  // `git<<EOF` glued as argv0 and misclassify this as non-mutating.
+  const cmd = "git<<EOF push origin main\nbody\nEOF";
+  const result = classify(cmd);
+  assert.equal(result.mutating, true, "glued-heredoc git push must be caught");
+});
+
 test("heredoc with dash-stripped form (<<-EOF) is also stripped", () => {
   const cmd = "cat <<-EOF\n\tgh pr create --title hi\n\tEOF";
   const result = classify(cmd);

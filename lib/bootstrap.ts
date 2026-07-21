@@ -16,15 +16,9 @@
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { GIT_HARDENING } from "./git-hardening.ts";
 import type { Executor } from "./identity.ts";
 import { isValidGhLogin } from "./identity.ts";
-
-const GIT_HARDENING: readonly string[] = [
-  "-c",
-  "core.fsmonitor=",
-  "-c",
-  "core.hooksPath=/dev/null",
-];
 
 /**
  * Parse `{owner, repo}` from a git remote URL. Mirrors `extract_owner` in

@@ -115,6 +115,19 @@ export interface GitPushInvocation {
  * Supports: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<<"EOF"`, `<<-"EOF"`. Quoted
  * delimiters disable parameter expansion in real bash; for classification
  * we treat them identically (we just need to skip the body).
+ *
+ * Deliberate divergence from `shared/shell-lex.ts`'s `stripHeredocs` — do NOT
+ * migrate this to the shared primitive (the #789 fold-in, resolved in
+ * ADR-0113). The two have genuinely different contracts: shared's copy KEEPS
+ * the `<<DELIM` operator on the introducing line so its own `lex()` can treat
+ * `<` as a redirect downstream; this copy EXCISES the operator because this
+ * module's `tokenize`/`splitSegments`/`parseGitPush` are argv-position matchers
+ * with no `<` awareness. Substituting shared's operator-preserving strip here
+ * reopens a git-push bypass: `git<<EOF push origin main` (valid bash — no
+ * whitespace needed before a redirect) would leave `git<<EOF` glued as argv[0],
+ * so `argv0 === "git"` fails and the push misclassifies as non-mutating. The
+ * duplication is intentional per ADR-0088; see the reciprocal note in
+ * `shared/shell-lex.ts`.
  */
 export function stripHeredocs(command: string): string {
   const lines = command.split("\n");

@@ -54,6 +54,89 @@ Read-only invocations (`gh pr list`, `gh api repos/foo/bar`, `git pull`,
 `gh issue view`, etc.) are not classified as mutating and pass through
 unchecked.
 
+### Runtime flow
+
+The `tool_call` lifecycle — classification, override parse, host resolution,
+the identity probe, and the notify/bootstrap surfaces:
+
+```mermaid
+sequenceDiagram
+    participant Model as Agent / model
+    participant Pi as pi runtime
+    participant Ext as index.ts
+    participant Clf as classifier.ts
+    participant Rem as remote.ts
+    participant Idn as identity.ts
+    participant Sub as gh / git subprocess
+    participant UI as ctx.ui
+
+    Model->>Pi: bash tool_call (command string)
+    Pi->>Ext: tool_call event (toolName=bash)
+    Ext->>Clf: classify(command)
+    Clf-->>Ext: mutating / unconditional / bypassNet / gitPushes / inlineSkip
+    Ext->>Ext: parseOverride(command)
+
+    alt classification has git pushes
+        Ext->>Rem: scopeGitPushes(cwd, pushes)
+        Rem->>Sub: git remote get-url --push --all (+ ssh -G for SSH forms)
+        Sub-->>Rem: resolved host
+        Rem-->>Ext: github / non-github / indeterminate
+    end
+
+    alt mutating AND in-scope host AND no non-probing exit
+        Ext->>Idn: resolve expected identity (tracked .pi/expected-identity, else settings.json)
+        Idn->>Sub: git ls-files --error-unmatch -- .pi/expected-identity
+        Ext->>Idn: probe active identity
+        Idn->>Sub: gh api /user --jq .login
+        Sub-->>Idn: active login (or ProbeError -> fail closed)
+    end
+
+    Ext->>UI: notify(reason, info/warning/error)
+    opt expected identity missing AND interactive
+        Ext->>UI: confirm + input (bootstrap .pi/expected-identity)
+    end
+    Ext-->>Pi: undefined (allow) OR { block: true, reason }
+    Pi-->>Model: tool executes, or blocked with reason
+```
+
+The full gate ladder — load-time skip, override precedence, classification,
+host-scoping, the bootstrap branch, and the allowlist:
+
+```mermaid
+flowchart TD
+    A["bash tool_call fires"] --> B{"SKIP_GH_IDENTITY_GUARD=1 at load?"}
+    B -- yes --> B1["no tool_call handler installed (announced at session_start if UI)"]
+    B -- no --> C["classify + parseOverride"]
+    C --> E{"override valid AND inline-skip present?"}
+    E -- yes --> E1["block: contradictory SKIP + OVERRIDE"]
+    E -- no --> F{"override malformed?"}
+    F -- yes --> F1["block: malformed GH_IDENTITY_OVERRIDE"]
+    F -- no --> G{"valid override?"}
+    G -- yes --> H{"mutating?"}
+    H -- no --> H1["allow (no probe on read-only)"]
+    H -- yes --> I{"git push to confirmed non-github.com?"}
+    I -- yes --> I1["allow (host out of scope)"]
+    I -- no --> J{"active == override login?"}
+    J -- yes --> J1["allow (notify: override active)"]
+    J -- no --> J2["block: override mismatch (no allowlist fallback)"]
+    G -- no --> M{"mutating?"}
+    M -- no --> M1["allow"]
+    M -- yes --> N{"git push to confirmed non-github.com?"}
+    N -- yes --> N1["allow (host out of scope)"]
+    N -- no --> O["resolve expected identity"]
+    O --> P{"expected logins resolved?"}
+    P -- no --> Q{"interactive AND not a bypass-net shape?"}
+    Q -- yes --> Q1["offer bootstrap -> write file, still block, commit + re-run"]
+    Q -- no --> R1["block: no expected identity configured"]
+    P -- yes --> S{"probe succeeded?"}
+    S -- no --> S1["block: probe error"]
+    S -- yes --> U{"active in expected list?"}
+    U -- yes --> U1["allow"]
+    U -- no --> V{"allowlist pattern matches?"}
+    V -- yes --> V1["allow (notify: allowlist hit)"]
+    V -- no --> X1["block: identity drift"]
+```
+
 ## Declaring the expected identity
 
 Precedence (first match wins):
@@ -149,8 +232,13 @@ SKIP_GH_IDENTITY_GUARD=1 pi
 ```
 
 Extension loads but installs no `tool_call` handler. Announced once at
-session start with the active identity for auditability. Visible in shell
-history.
+session start with the active identity for auditability — **in an
+interactive (UI) session only**. In a headless/no-UI run (`pi -p`) the
+`ctx.ui.notify` is suppressed by the `ctx.hasUI` guard, so the session-wide
+bypass is not announced; it remains visible in shell history and in the
+launching command. Accepted gap, parallel to the per-command headless-skip
+gap in Operator notes. So "silent overrides are not supported" holds for
+interactive sessions; headless is the documented exception.
 
 **Per-command** (inline prefix on a single mutating call):
 
@@ -264,9 +352,14 @@ confusion in multi-repo workflows.
   github.com remote *away* from github.com is an integrity concern downstream
   of the guard, not a wrong-identity bypass (ADR-0023). An inline
   `-c …insteadOf=` on the push command itself is detected and fails closed.
-- Subagent shells that don't load the extension. Mitigation:
-  `scripts/validate.sh` ensures any subagent wrapper granting `bash` also
-  loads `gh-identity-guard`.
+- Subagent shells that don't load the extension. Mitigation: the extension
+  is **auto-discovered and loaded for every session** (global
+  `~/.pi/agent/extensions/`), so a subagent inherits it just like the parent;
+  the git pre-push hook is the backstop for any `git push` path the
+  in-session layer cannot see. There is **no** per-wrapper `validate.sh` gate
+  today — whether one adds real defense-in-depth (extensions are not
+  excludable per-wrapper) is tracked in
+  #802.
 - Raw `curl -X POST -H "Authorization: bearer $(gh auth token)" api.github.com/...`
   (token-extraction bypass; Phase-2 classifier extension if real-world
   pressure justifies it).
@@ -275,16 +368,25 @@ confusion in multi-repo workflows.
 - TOCTOU between probe and execution (~tens of ms; bounded but not zero).
 - The override env var itself if set in `~/.zshrc` (announce-at-init
   notify mitigates).
+- **Adversarial classifier obfuscation** — `$IFS`-substitution word-splitting,
+  glued command-substitution (`g$()h`), and pipe-into-decode payloads that
+  reconstruct a `gh`/`git push` verb only at runtime (ADR-0022 § Q2). The
+  classifier reads the raw command string and does not runtime-expand it; the
+  bypass-DENY net catches the common `bash -c`/`eval`/`$(…)` shapes by forcing
+  verification, but arbitrary obfuscation is out of scope by the same
+  undecidability argument as `bash-destructive-guard` (ADR-0072). This is a
+  naive-misuse guard, not an adversary-resistant sandbox.
 
 ## Composition with other bash guards
 
 Loaded alongside `secrets-guard` and `bash-destructive-guard`. All three
-are deny-only and ordering-independent; pi's `tool_call` handler ordering
-across extensions is undocumented in v0.75.5 (`tool_result`,
-`before_provider_request`, `after_provider_response` are all documented
-as load-order; `tool_call` is not). Worst case is a redundant block by
-the second-firing guard. Each guard names itself in its `reason:` text
-so operators can identify which one fired.
+are deny-only and ordering-independent; the **cross-extension** firing order
+of `tool_call` handlers remains unspecified as of the pinned pi runtime
+(v0.80.10-psmfd.1) — its `docs/extensions.md` lifecycle documents that
+`tool_call` fires and can block, but not which registered extension's handler
+runs first when several are loaded. Worst case is a redundant block by the
+second-firing guard. Each guard names itself in its `reason:` text so
+operators can identify which one fired.
 
 ## Operator notes
 
@@ -305,6 +407,12 @@ so operators can identify which one fired.
 - For non-pi consumers (git hooks, CI, ad-hoc shell), use the sourceable
   helper `scripts/lib/gh-verify-user.sh` (`gh_verify_user <login>`) — same
   probe logic, no pi dependency.
+- Every git subprocess this extension spawns (remote resolution, tracked-file
+  check, interactive bootstrap) is hardened with
+  `-c core.fsmonitor= -c core.hooksPath=/dev/null`, so a hostile repo's local
+  config cannot execute code when the guard merely resolves a remote
+  (CVE-2026-45033 class; security-review #265). The flags live in one place,
+  `lib/git-hardening.ts`.
 
 ## Companion control surfaces
 
@@ -314,8 +422,91 @@ so operators can identify which one fired.
   Belt-and-suspenders documentation of *why* the guard exists, surviving
   the extension as a fallback for sessions where the extension is disabled.
 - **Helper script** `scripts/lib/gh-verify-user.sh` for non-pi consumers.
-- **Companion git pre-push hook** (#257,
-  deferred) closes the raw-shell-outside-pi gap.
+- **Companion git pre-push hook** ([`hooks/gh-identity-guard.sh`](https://github.com/psmfd/pi-config/blob/main/hooks/gh-identity-guard.sh),
+  shipped via #260 /
+  #257) closes the
+  raw-shell-outside-pi `git push` gap. Install via `INSTALL_GIT_HOOKS=1 ./setup.sh`.
+
+## Architecture
+
+Module structure, the pinned pi API surface, on-disk artifacts, the companion
+control surfaces, and the distribution path:
+
+```mermaid
+flowchart LR
+    subgraph EXT["gh-identity-guard/"]
+        IDX["index.ts (tool_call + session_start)"]
+        CLF["lib/classifier.ts"]
+        NOU["lib/nouns.ts (mutation tables)"]
+        IDN["lib/identity.ts"]
+        REM["lib/remote.ts"]
+        OVR["lib/overrides.ts"]
+        BOOT["lib/bootstrap.ts"]
+        GH["lib/git-hardening.ts"]
+    end
+    IDX --> CLF
+    CLF --> NOU
+    IDX --> IDN
+    IDX --> REM
+    IDX --> OVR
+    IDX --> BOOT
+    REM --> CLF
+    OVR --> IDN
+    BOOT --> IDN
+    IDN --> GH
+    REM --> GH
+    BOOT --> GH
+
+    subgraph PINNED["pinned pi API (v0.80.10-psmfd.1)"]
+        API1["ExtensionAPI.on: tool_call / session_start"]
+        API2["ctx: ui.notify/confirm/input, hasUI, cwd, signal"]
+    end
+    IDX --> API1
+    IDX --> API2
+
+    subgraph DISK["on-disk artifacts"]
+        D1["repo .pi/expected-identity (git-tracked pin)"]
+        D2["repo .gh-identity-allowlist"]
+        D3["~/.pi/agent/settings.json extensionSettings.ghIdentityGuard"]
+    end
+    IDN --> D1
+    IDN --> D3
+    OVR --> D2
+    BOOT --> D1
+
+    subgraph SHAREDLIB["shared/ (deliberately NOT imported)"]
+        SL["shell-lex.ts stripHeredocs — operator-preserving; NOT equivalent to the classifier's operator-excising copy (ADR-0113)"]
+    end
+    CLF -.->|"deliberate divergence, not drift (#789/ADR-0113/ADR-0088)"| SL
+
+    subgraph COMPANION["companion control surfaces"]
+        HOOK["hooks/gh-identity-guard.sh (pre-push, raw-shell layer)"]
+        HELPER["scripts/lib/gh-verify-user.sh"]
+    end
+    HOOK -.->|"shares expected-identity + probe helper"| REM
+
+    subgraph MIRROR["mirror distribution"]
+        MT["mirror/targets.yml pi-gh-identity-guard (overlay, inline: [])"]
+        INS["install.sh pin @v0.1.1"]
+    end
+    EXT -.-> MT
+    MT -.-> INS
+
+    subgraph ADRPROV["ADR provenance"]
+        A22["ADR-0022 core design"]
+        A23["ADR-0023 host scoping"]
+        A24["ADR-0024 inline skip"]
+        A25["ADR-0025 bootstrap"]
+        A27["ADR-0027 tracked-only pin"]
+        A113["ADR-0113 stripHeredocs divergence"]
+    end
+    IDX -.-> A22
+    REM -.-> A23
+    IDX -.-> A24
+    BOOT -.-> A25
+    IDN -.-> A27
+    CLF -.-> A113
+```
 
 ## References
 
@@ -324,6 +515,7 @@ so operators can identify which one fired.
 - ADR-0024 — per-command inline skip + override-hint hardening (#276)
 - ADR-0025 — interactive bootstrap of `.pi/expected-identity` (#294)
 - ADR-0027 — tracked-only `.pi/expected-identity` read gate (#306)
+- ADR-0113 — why the classifier keeps its own `stripHeredocs` (divergence from `shared/shell-lex.ts`; #789)
 - #217 / #251 — original defect + procedural fix
 - #252 — this implementation
 - #265 — in-session layer over-blocked non-github.com (e.g. Azure DevOps) pushes

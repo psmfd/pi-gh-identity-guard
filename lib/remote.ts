@@ -37,25 +37,13 @@
 import { isAbsolute, resolve } from "node:path";
 
 import type { GitPushInvocation } from "./classifier.ts";
+import { GIT_HARDENING } from "./git-hardening.ts";
 import type { Executor } from "./identity.ts";
 
 export type { GitPushInvocation };
 
 /** In-scope (`github.com`), out-of-scope, or could-not-determine. */
 export type HostVerdict = "github" | "non-github" | "indeterminate";
-
-/**
- * Flags prepended to every git subprocess to neutralise local-config code
- * execution in a possibly-hostile working directory. `git remote get-url`
- * and `git rev-parse` can trigger `core.fsmonitor` / hook execution; pinning
- * both to inert values closes that vector. Source: security-review #265.
- */
-const GIT_HARDENING: readonly string[] = [
-  "-c",
-  "core.fsmonitor=",
-  "-c",
-  "core.hooksPath=/dev/null",
-];
 
 /**
  * Extract the host component of a git remote URL. Mirrors the hardened

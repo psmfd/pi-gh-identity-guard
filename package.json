@@ -1,6 +1,6 @@
 {
   "name": "@psmfd/pi-gh-identity-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Pi extension: blocks mutating gh and git push operations when the active GitHub identity is wrong for the target repo",
   "type": "module",
   "license": "MIT",

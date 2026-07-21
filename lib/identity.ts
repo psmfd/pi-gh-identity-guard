@@ -19,6 +19,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { GIT_HARDENING } from "./git-hardening.ts";
+
 /** Strip line comments (`# ...`) and trim. Empty lines become "". */
 function cleanLine(raw: string): string {
   const hashIdx = raw.indexOf("#");
@@ -63,13 +65,6 @@ export function isValidGhLogin(login: string): boolean {
  * mutually exclusive: a read failure short-circuits before parsing.
  */
 type TrackingStatus = "tracked" | "untracked" | "indeterminate";
-
-const GIT_HARDENING: readonly string[] = [
-  "-c",
-  "core.fsmonitor=",
-  "-c",
-  "core.hooksPath=/dev/null",
-];
 
 const EMPTY_PER_REPO_RESULT = {
   logins: null,
